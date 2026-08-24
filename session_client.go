@@ -76,8 +76,23 @@ func (c *MessageSessionClient) deleteMessageSession(ctx context.Context, runnerS
 	return c.doSessionRequest(ctx, http.MethodDelete, path, nil, http.StatusNoContent, nil)
 }
 
-// RefreshMessageSession refreshes a message session for the specified runner scale set.
-// This should be used when a MessageQueueTokenExpiredError is encountered.
+// RefreshMessageSession refreshes the message session, storing the refreshed session state
+// (including a fresh message queue access token) for subsequent calls.
+//
+// GetMessage, DeleteMessage, and AcquireJobs already refresh the session automatically when its
+// message queue token expires, so most clients never need to call this. Its purpose is periodic
+// verification of session ownership: the message queue token can outlive the session itself, so
+// a client idling in successful long polls has no built-in signal that the service expired or
+// removed its session and admitted another client. A refresh of a session the service no longer
+// recognizes fails with an error wrapping NotFoundError, at which point the session is gone and
+// a new one must be created via Client.MessageSessionClient.
+func (c *MessageSessionClient) RefreshMessageSession(ctx context.Context) error {
+	return c.refreshMessageSession(ctx, c.Session())
+}
+
+// refreshMessageSession refreshes a message session for the specified runner scale set.
+// This should be used when a MessageQueueTokenExpiredError is encountered. It no-ops when the
+// stored session no longer matches expiredSession: a concurrent caller already refreshed.
 func (c *MessageSessionClient) refreshMessageSession(ctx context.Context, expiredSession RunnerScaleSetSession) error {
 	c.refreshMu.Lock()
 	defer c.refreshMu.Unlock()

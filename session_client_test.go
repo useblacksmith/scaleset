@@ -952,3 +952,83 @@ func TestAcquireJobs(t *testing.T) {
 		assert.Empty(t, got)
 	})
 }
+
+func TestRefreshMessageSession(t *testing.T) {
+	ctx := context.Background()
+	auth := actionsAuth{
+		token: "token",
+	}
+
+	t.Run("Refresh stores the refreshed session", func(t *testing.T) {
+		oldToken := "old-message-token"
+		newToken := "new-message-token"
+
+		var handleSessionRequest http.HandlerFunc
+		var refreshRequests atomic.Int32
+		server := newActionsServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "sessions") {
+				handleSessionRequest(w, r)
+				return
+			}
+			require.True(t, strings.Contains(r.URL.Path, "/sessions/"))
+			require.Equal(t, http.MethodPatch, r.Method)
+			refreshRequests.Add(1)
+			handleSessionRequest(w, r)
+		}))
+
+		initialSession := server.testRunnerScaleSetSession()
+		initialSession.MessageQueueAccessToken = oldToken
+		refreshedSession := server.testRunnerScaleSetSession()
+		refreshedSession.SessionID = initialSession.SessionID
+		refreshedSession.MessageQueueAccessToken = newToken
+		handleSessionRequest = newTestSessionRequestHandler(t, initialSession)
+
+		client, err := newClient(
+			testSystemInfo,
+			server.configURLForOrg("my-org"),
+			auth,
+		)
+		require.NoError(t, err)
+
+		sessionClient, err := client.MessageSessionClient(ctx, 1, "my-org")
+		require.NoError(t, err)
+		require.Equal(t, oldToken, sessionClient.Session().MessageQueueAccessToken)
+		handleSessionRequest = newTestSessionRequestHandler(t, refreshedSession)
+
+		require.NoError(t, sessionClient.RefreshMessageSession(ctx))
+		assert.Equal(t, int32(1), refreshRequests.Load())
+		assert.Equal(t, newToken, sessionClient.Session().MessageQueueAccessToken)
+		assert.Equal(t, initialSession.SessionID, sessionClient.Session().SessionID)
+	})
+
+	t.Run("Refresh of a lost session returns NotFoundError", func(t *testing.T) {
+		var handleSessionRequest http.HandlerFunc
+		server := newActionsServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "sessions") {
+				handleSessionRequest(w, r)
+				return
+			}
+			require.Equal(t, http.MethodPatch, r.Method)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte(`{"typeName": "SessionNotFoundException","message": "session does not exist"}`))
+		}))
+		handleSessionRequest = newTestSessionRequestHandler(t, server.testRunnerScaleSetSession())
+
+		client, err := newClient(
+			testSystemInfo,
+			server.configURLForOrg("my-org"),
+			auth,
+		)
+		require.NoError(t, err)
+
+		sessionClient, err := client.MessageSessionClient(ctx, 1, "my-org")
+		require.NoError(t, err)
+		before := sessionClient.Session()
+
+		err = sessionClient.RefreshMessageSession(ctx)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, NotFoundError)
+		assert.Equal(t, before, sessionClient.Session(), "a failed refresh must not replace the stored session")
+	})
+}
