@@ -103,20 +103,36 @@ func (a *GitHubAppAuth) Validate() error {
 	return nil
 }
 
+// TokenSource returns a GitHub token that can create runner registration
+// tokens for the client's config URL: an installation access token or a
+// personal access token. The client calls it on every Actions service admin
+// token refresh and uses the result only for that refresh, so a source may hand
+// out short-lived tokens, such as installation tokens minted by another service
+// that holds the GitHub App's private key.
+type TokenSource func(ctx context.Context) (string, error)
+
 type actionsAuth struct {
 	// app is the GitHub app credentials
 	app *GitHubAppAuth
 	// GitHub PAT
 	token string
+	// tokenSource supplies a fresh token on every admin token refresh
+	tokenSource TokenSource
 }
 
-// validate does the basic validation check, ensuring that
-// either GitHub App credentials or a personal access token is provided.
+// validate does the basic validation check, ensuring that exactly one of
+// GitHub App credentials, a personal access token or a token source is provided.
 // If GitHub App credentials are provided, it further validates the credentials.
 //
 // This method does not validate the credentials against GitHub, so it does not
 // check if the credentials are correct or have the necessary permissions.
 func (a actionsAuth) validate() error {
+	if a.tokenSource != nil {
+		if a.token != "" || a.app != nil {
+			return fmt.Errorf("cannot provide a token source together with GitHub App credentials or a personal access token")
+		}
+		return nil
+	}
 	if a.token == "" && a.app == nil {
 		return fmt.Errorf("either GitHub App credentials or personal access token is required")
 	}
@@ -187,6 +203,30 @@ func NewClientWithPersonalAccessToken(config NewClientWithPersonalAccessTokenCon
 		config.GitHubConfigURL,
 		actionsAuth{
 			token: config.PersonalAccessToken,
+		},
+		options...,
+	)
+}
+
+// NewClientWithTokenSourceConfig contains the configuration for creating a new Client whose
+// GitHub token comes from a TokenSource.
+type NewClientWithTokenSourceConfig struct {
+	GitHubConfigURL string
+	TokenSource     TokenSource
+	SystemInfo      SystemInfo
+}
+
+// NewClientWithTokenSource creates a new Client that asks TokenSource for a GitHub token
+// every time it refreshes the Actions service admin token.
+func NewClientWithTokenSource(config NewClientWithTokenSourceConfig, options ...HTTPOption) (*Client, error) {
+	if config.TokenSource == nil {
+		return nil, fmt.Errorf("invalid credentials: token source is required")
+	}
+	return newClient(
+		config.SystemInfo,
+		config.GitHubConfigURL,
+		actionsAuth{
+			tokenSource: config.TokenSource,
 		},
 		options...,
 	)
@@ -815,9 +855,19 @@ func (c *Client) getRunnerRegistrationToken(ctx context.Context) (*registrationT
 
 	bearerToken := ""
 
-	if c.creds.token != "" {
+	switch {
+	case c.creds.tokenSource != nil:
+		token, err := c.creds.tokenSource(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get token from token source: %w", err)
+		}
+		if token == "" {
+			return nil, fmt.Errorf("token source returned an empty token")
+		}
+		bearerToken = fmt.Sprintf("Bearer %v", token)
+	case c.creds.token != "":
 		bearerToken = fmt.Sprintf("Bearer %v", c.creds.token)
-	} else {
+	default:
 		accessToken, err := c.fetchAccessToken(ctx, c.creds.app)
 		if err != nil {
 			return nil, fmt.Errorf("failed to fetch access token: %w", err)

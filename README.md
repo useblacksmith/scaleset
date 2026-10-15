@@ -142,10 +142,11 @@ If you are not a Go developer, you can still:
 
 ## Authentication
 
-Two options:
+Three options:
 
 1. **GitHub App (preferred):** Stronger scoping & rotation. Provide: `ClientID`, `InstallationID`, `PrivateKey`.
 2. **PAT (personal access token):** Simpler but broader scoped.
+3. **Token source:** `NewClientWithTokenSource` calls your function for a GitHub token on every admin token refresh. Use it when another service holds the GitHub App's private key and hands out short-lived installation tokens.
 
 The client automatically exchanges credentials for a registration token + admin token behind the scenes and refreshes them before expiry.
 

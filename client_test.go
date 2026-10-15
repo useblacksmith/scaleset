@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -239,6 +240,127 @@ func TestNewClientWithBothTokenAndGitHubApp(t *testing.T) {
 		assert.Nil(t, client)
 		assert.Contains(t, err.Error(), "invalid credentials")
 		assert.Contains(t, err.Error(), "cannot provide both GitHub App credentials and personal access token")
+	})
+}
+
+func TestNewClientWithTokenSource(t *testing.T) {
+	source := func(context.Context) (string, error) { return "ghs_test_token", nil }
+
+	t.Run("creates client with token source", func(t *testing.T) {
+		client, err := NewClientWithTokenSource(NewClientWithTokenSourceConfig{
+			GitHubConfigURL: "https://github.example.com/my-org",
+			TokenSource:     source,
+			SystemInfo:      testSystemInfo,
+		})
+		require.NoError(t, err)
+		require.NotNil(t, client)
+
+		assert.NotNil(t, client.creds.tokenSource)
+		assert.Nil(t, client.creds.app)
+		assert.Equal(t, "", client.creds.token)
+		assert.Equal(t, "my-org", client.config.organization)
+		assert.Equal(t, testSystemInfo, client.SystemInfo())
+	})
+
+	t.Run("returns error when token source is missing", func(t *testing.T) {
+		client, err := NewClientWithTokenSource(NewClientWithTokenSourceConfig{
+			GitHubConfigURL: "https://github.example.com/my-org",
+			SystemInfo:      testSystemInfo,
+		})
+		require.Error(t, err)
+		assert.Nil(t, client)
+		assert.Contains(t, err.Error(), "invalid credentials")
+		assert.Contains(t, err.Error(), "token source is required")
+	})
+
+	t.Run("returns error when combined with other credentials", func(t *testing.T) {
+		client, err := newClient(
+			testSystemInfo,
+			"https://github.example.com/my-org",
+			actionsAuth{
+				token:       "ghp_test_token",
+				tokenSource: source,
+			},
+		)
+		require.Error(t, err)
+		assert.Nil(t, client)
+		assert.Contains(t, err.Error(), "invalid credentials")
+		assert.Contains(t, err.Error(), "cannot provide a token source together with GitHub App credentials or a personal access token")
+	})
+}
+
+func TestTokenSourceAuthenticatesEveryAdminTokenRefresh(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("each refresh asks the source for a new token", func(t *testing.T) {
+		var mu sync.Mutex
+		var registrationAuth []string
+		server := testserver.New(
+			t,
+			nil,
+			testserver.WithRunnerRegistrationTokenHandler(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				registrationAuth = append(registrationAuth, r.Header.Get("Authorization"))
+				mu.Unlock()
+				w.WriteHeader(http.StatusCreated)
+				w.Write([]byte(`{"token":"registration-token"}`))
+			}),
+		)
+
+		calls := 0
+		client, err := NewClientWithTokenSource(NewClientWithTokenSourceConfig{
+			GitHubConfigURL: server.ConfigURLForOrg("my-org"),
+			TokenSource: func(context.Context) (string, error) {
+				calls++
+				return fmt.Sprintf("installation-token-%d", calls), nil
+			},
+			SystemInfo: testSystemInfo,
+		})
+		require.NoError(t, err)
+
+		_, err = client.newActionsServiceRequest(ctx, http.MethodGet, "my-path", nil)
+		require.NoError(t, err)
+
+		client.actionsServiceAdminToken = actionsServiceAdminToken{
+			token:     "expiring-token",
+			expiresAt: time.Now().Add(59 * time.Second),
+		}
+		_, err = client.newActionsServiceRequest(ctx, http.MethodGet, "my-path", nil)
+		require.NoError(t, err)
+
+		mu.Lock()
+		defer mu.Unlock()
+		assert.Equal(t, []string{"Bearer installation-token-1", "Bearer installation-token-2"}, registrationAuth)
+	})
+
+	t.Run("a failing source fails the refresh", func(t *testing.T) {
+		server := testserver.New(t, nil)
+		client, err := NewClientWithTokenSource(NewClientWithTokenSourceConfig{
+			GitHubConfigURL: server.ConfigURLForOrg("my-org"),
+			TokenSource: func(context.Context) (string, error) {
+				return "", errors.New("credentials backend unavailable")
+			},
+			SystemInfo: testSystemInfo,
+		})
+		require.NoError(t, err)
+
+		_, err = client.newActionsServiceRequest(ctx, http.MethodGet, "my-path", nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "credentials backend unavailable")
+	})
+
+	t.Run("an empty token fails the refresh", func(t *testing.T) {
+		server := testserver.New(t, nil)
+		client, err := NewClientWithTokenSource(NewClientWithTokenSourceConfig{
+			GitHubConfigURL: server.ConfigURLForOrg("my-org"),
+			TokenSource:     func(context.Context) (string, error) { return "", nil },
+			SystemInfo:      testSystemInfo,
+		})
+		require.NoError(t, err)
+
+		_, err = client.newActionsServiceRequest(ctx, http.MethodGet, "my-path", nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "token source returned an empty token")
 	})
 }
 
